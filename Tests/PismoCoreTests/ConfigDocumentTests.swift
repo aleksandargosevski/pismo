@@ -54,6 +54,29 @@ private let handWritten = """
     #expect(document.apps[slack]?.fields.map(\.name) == ["composer v2", "search"])
 }
 
+@Test func overlaysRoundTripAndExtendBuiltInList() throws {
+    let source = """
+    {
+      "default": "ABC",
+      "overlays": ["com.1password.1password"],
+      "apps": {}
+    }
+
+    """
+    let document = try ConfigDocument.parse(Data(source.utf8))
+    #expect(document.serialized() == source)
+
+    let config = try document.compile()
+    #expect(config.overlays.contains("com.1password.1password"))
+    #expect(config.overlays.isSuperset(of: Config.builtInOverlays))
+}
+
+@Test func builtInOverlaysApplyWithoutConfig() throws {
+    let config = try ConfigDocument.parse(Data(handWritten.utf8)).compile()
+    #expect(config.overlays == Config.builtInOverlays)
+    #expect(config.overlays.contains("com.raycast.macos"))
+}
+
 @Test func choosingDefaultLayoutRemovesEmptyApp() {
     var document = ConfigDocument(defaultLayout: "ABC")
     document.setAppLayout("Serbian", for: "com.apple.Notes")

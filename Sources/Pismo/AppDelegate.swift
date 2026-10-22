@@ -99,6 +99,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
             configMenuItem.toolTip = error.localizedDescription
             inspectorLog.write("Config error: \(error.localizedDescription)")
         }
+        focusMonitor.overlayBundleIdentifiers = configStore.config?.overlays ?? Config.builtInOverlays
         focusMonitor.refresh()
     }
 

@@ -5,6 +5,7 @@ import Foundation
 /// ```json
 /// {
 ///   "default": "ABC",
+///   "overlays": ["com.1password.1password"],
 ///   "apps": {
 ///     "com.tinyspeck.slackmacgap": {
 ///       "layout": "ABC",
@@ -17,13 +18,24 @@ import Foundation
 /// ```
 /// Layouts are referenced by name ("Serbian") or input source id ("com.apple.keylayout.Serbian").
 /// Match values are regular expressions; every listed attribute must match.
+/// Overlays are apps that show a focused panel without becoming the frontmost app; the listed
+/// bundle ids are added to `builtInOverlays`.
 public struct Config {
+    public static let builtInOverlays: Set<String> = [
+        "com.raycast.macos",
+        "com.runningwithcrayons.Alfred",
+        "com.apple.Spotlight",
+    ]
+
     public let defaultLayout: String
     public let apps: [String: AppRule]
+    /// Bundle ids of overlay apps, including the built-in ones.
+    public let overlays: Set<String>
 
-    public init(defaultLayout: String, apps: [String: AppRule] = [:]) {
+    public init(defaultLayout: String, apps: [String: AppRule] = [:], extraOverlays: [String] = []) {
         self.defaultLayout = defaultLayout
         self.apps = apps
+        self.overlays = Self.builtInOverlays.union(extraOverlays)
     }
 
     public static func parse(_ data: Data) throws -> Config {

@@ -15,68 +15,148 @@ struct FocusContext {
 /// field gains focus. Containers (windows, web areas) are ignored since nothing is typed into them,
 /// and repeated reports for the same element are dropped, so a layout picked by hand stays until
 /// focus actually moves to another field.
+///
+/// Overlay apps (launchers such as Raycast) show a focused panel without becoming the frontmost
+/// app, so no activation is reported for them. They are observed separately: while one of them has
+/// a focused window it takes precedence, and once it closes the frontmost app's layout is restored.
 final class FocusMonitor {
     var onFocusChange: ((FocusContext) -> Void)?
 
-    private var workspaceObserver: NSObjectProtocol?
-    private var axObserver: AXObserver?
-    private var observedApp: NSRunningApplication?
-    private var observedAppElement: AXUIElement?
+    var overlayBundleIdentifiers: Set<String> = [] {
+        didSet { syncOverlayObservers() }
+    }
+
+    private var isRunning = false
+    private var workspaceObservers: [NSObjectProtocol] = []
+    private var frontmostApp: ObservedApp?
+    private var overlayApps: [pid_t: ObservedApp] = [:]
+    private var activeOverlay: ObservedApp?
     private var lastReportedElement: AXUIElement?
     private var pendingEvaluation: DispatchWorkItem?
 
     /// Chromium builds its accessibility tree lazily after AXManualAccessibility is set.
     private let chromiumTreeDelay: TimeInterval = 0.3
     private let focusSettleDelay: TimeInterval = 0.08
-    private let messagingTimeout: Float = 0.5
     private let containerRoles: Set<String> = [kAXWindowRole, kAXApplicationRole, "AXWebArea"]
     private let containerSubroles: Set<String> = ["AXWebApplication"]
+    private let overlayNotifications = [
+        kAXFocusedWindowChangedNotification,
+        kAXFocusedUIElementChangedNotification,
+        kAXWindowCreatedNotification,
+        kAXUIElementDestroyedNotification,
+    ]
+
+    private var reportedApp: ObservedApp? { activeOverlay ?? frontmostApp }
 
     func start() {
-        workspaceObserver = NSWorkspace.shared.notificationCenter.addObserver(
-            forName: NSWorkspace.didActivateApplicationNotification,
-            object: nil,
-            queue: .main
-        ) { [weak self] notification in
-            guard let app = notification.userInfo?[NSWorkspace.applicationUserInfoKey] as? NSRunningApplication else { return }
-            self?.observe(app)
-        }
+        isRunning = true
+        let center = NSWorkspace.shared.notificationCenter
+        workspaceObservers = [
+            center.addObserver(forName: NSWorkspace.didActivateApplicationNotification, object: nil, queue: .main) { [weak self] notification in
+                guard let app = notification.userInfo?[NSWorkspace.applicationUserInfoKey] as? NSRunningApplication else { return }
+                self?.observeFrontmost(app)
+            },
+            center.addObserver(forName: NSWorkspace.didLaunchApplicationNotification, object: nil, queue: .main) { [weak self] _ in
+                self?.syncOverlayObservers()
+            },
+            center.addObserver(forName: NSWorkspace.didTerminateApplicationNotification, object: nil, queue: .main) { [weak self] _ in
+                self?.syncOverlayObservers()
+            },
+        ]
 
+        syncOverlayObservers()
         if let frontmost = NSWorkspace.shared.frontmostApplication {
-            observe(frontmost)
+            observeFrontmost(frontmost)
         }
     }
 
     func stop() {
-        if let workspaceObserver {
-            NSWorkspace.shared.notificationCenter.removeObserver(workspaceObserver)
-        }
-        workspaceObserver = nil
-        stopObservingCurrentApp()
+        isRunning = false
+        workspaceObservers.forEach(NSWorkspace.shared.notificationCenter.removeObserver)
+        workspaceObservers = []
+        pendingEvaluation?.cancel()
+        pendingEvaluation = nil
+        frontmostApp = nil
+        overlayApps = [:]
+        activeOverlay = nil
+        lastReportedElement = nil
     }
 
     /// Re-reports the current focus, e.g. after the config changed.
     func refresh() {
-        guard let appElement = observedAppElement else { return }
-        report(focusedElement(of: appElement), force: true)
+        guard let app = reportedApp else { return }
+        report(app, element: focusedElement(of: app), force: true)
     }
 
-    fileprivate func handleFocusedElementChanged() {
+    private func observeFrontmost(_ app: NSRunningApplication) {
+        pendingEvaluation?.cancel()
+        activeOverlay = nil
+        lastReportedElement = nil
+
+        let observed = ObservedApp(app, notifications: [kAXFocusedUIElementChangedNotification]) { [weak self] in
+            self?.handleFocusNotification()
+        }
+        enableChromiumAccessibility(observed.element)
+        frontmostApp = observed
+
+        // Switching apps always applies a layout, even when no field is focused yet.
+        report(observed, element: focusedElement(of: observed), force: true)
+        scheduleEvaluation(after: chromiumTreeDelay)
+    }
+
+    private func syncOverlayObservers() {
+        guard isRunning else { return }
+        let running = NSWorkspace.shared.runningApplications.filter { app in
+            app.bundleIdentifier.map(overlayBundleIdentifiers.contains) ?? false
+        }
+        let runningPids = Set(running.map(\.processIdentifier))
+
+        overlayApps = overlayApps.filter { runningPids.contains($0.key) }
+        for app in running where overlayApps[app.processIdentifier] == nil {
+            overlayApps[app.processIdentifier] = ObservedApp(app, notifications: overlayNotifications) { [weak self] in
+                self?.handleFocusNotification()
+            }
+        }
+
+        if let activeOverlay, overlayApps[activeOverlay.pid] == nil {
+            scheduleEvaluation(after: 0)
+        }
+    }
+
+    private func handleFocusNotification() {
         scheduleEvaluation(after: focusSettleDelay)
     }
 
     private func scheduleEvaluation(after delay: TimeInterval) {
         pendingEvaluation?.cancel()
-        let work = DispatchWorkItem { [weak self] in self?.evaluateFocusedElement() }
+        let work = DispatchWorkItem { [weak self] in self?.evaluateFocus() }
         pendingEvaluation = work
         DispatchQueue.main.asyncAfter(deadline: .now() + delay, execute: work)
     }
 
-    private func evaluateFocusedElement() {
-        guard let appElement = observedAppElement,
-              let element = focusedElement(of: appElement),
+    private func evaluateFocus() {
+        let overlay = visibleOverlay()
+        if overlay !== activeOverlay {
+            activeOverlay = overlay
+            // Like an app switch: opening an overlay applies its layout, closing it restores the app's.
+            if let app = reportedApp {
+                report(app, element: focusedElement(of: app), force: true)
+            }
+            return
+        }
+
+        guard let app = reportedApp,
+              let element = focusedElement(of: app),
               !isContainer(element) else { return }
-        report(element, force: false)
+        report(app, element: element, force: false)
+    }
+
+    /// An overlay counts as open while it has a focused window. An overlay that is itself the
+    /// frontmost app (e.g. its settings window) is handled as a regular app.
+    private func visibleOverlay() -> ObservedApp? {
+        overlayApps.values.first { overlay in
+            overlay.pid != frontmostApp?.pid && AX.element(overlay.element, kAXFocusedWindowAttribute) != nil
+        }
     }
 
     private func isContainer(_ element: AXUIElement) -> Bool {
@@ -85,74 +165,22 @@ final class FocusMonitor {
         return false
     }
 
-    private func observe(_ app: NSRunningApplication) {
-        stopObservingCurrentApp()
-        observedApp = app
-
-        let pid = app.processIdentifier
-        let appElement = AXUIElementCreateApplication(pid)
-        AXUIElementSetMessagingTimeout(appElement, messagingTimeout)
-        enableChromiumAccessibility(appElement)
-        observedAppElement = appElement
-
-        if let observer = makeFocusObserver(for: appElement, app: app) {
-            CFRunLoopAddSource(CFRunLoopGetMain(), AXObserverGetRunLoopSource(observer), .commonModes)
-            axObserver = observer
-        }
-
-        // Switching apps always applies a layout, even when no field is focused yet.
-        report(focusedElement(of: appElement), force: true)
-        scheduleEvaluation(after: chromiumTreeDelay)
-    }
-
-    private func makeFocusObserver(for appElement: AXUIElement, app: NSRunningApplication) -> AXObserver? {
-        let appName = app.localizedName ?? "pid \(app.processIdentifier)"
-
-        var observer: AXObserver?
-        let createResult = AXObserverCreate(app.processIdentifier, focusChangedCallback, &observer)
-        guard createResult == .success, let observer else {
-            NSLog("Pismo: cannot observe \(appName) (AX error \(createResult.rawValue)); only its app rule applies")
-            return nil
-        }
-
-        let refcon = Unmanaged.passUnretained(self).toOpaque()
-        let addResult = AXObserverAddNotification(observer, appElement, kAXFocusedUIElementChangedNotification as CFString, refcon)
-        guard addResult == .success else {
-            NSLog("Pismo: \(appName) does not report focus changes (AX error \(addResult.rawValue)); only its app rule applies")
-            return nil
-        }
-        return observer
-    }
-
-    private func stopObservingCurrentApp() {
-        if let axObserver {
-            CFRunLoopRemoveSource(CFRunLoopGetMain(), AXObserverGetRunLoopSource(axObserver), .commonModes)
-        }
-        pendingEvaluation?.cancel()
-        pendingEvaluation = nil
-        axObserver = nil
-        observedApp = nil
-        observedAppElement = nil
-        lastReportedElement = nil
-    }
-
     /// Electron/Chromium apps (Slack, VS Code, ...) only expose their UI tree when asked explicitly.
     private func enableChromiumAccessibility(_ appElement: AXUIElement) {
         AXUIElementSetAttributeValue(appElement, "AXManualAccessibility" as CFString, kCFBooleanTrue)
     }
 
-    private func focusedElement(of appElement: AXUIElement) -> AXUIElement? {
-        AX.element(appElement, kAXFocusedUIElementAttribute)
+    private func focusedElement(of app: ObservedApp) -> AXUIElement? {
+        AX.element(app.element, kAXFocusedUIElementAttribute)
     }
 
-    private func report(_ element: AXUIElement?, force: Bool) {
-        guard let app = observedApp else { return }
+    private func report(_ observed: ObservedApp, element: AXUIElement?, force: Bool) {
         if !force, isSameElement(element, lastReportedElement) { return }
         lastReportedElement = element
 
         let context = FocusContext(
-            appName: app.localizedName ?? "Unknown",
-            bundleIdentifier: app.bundleIdentifier,
+            appName: observed.name,
+            bundleIdentifier: observed.app.bundleIdentifier,
             element: element.map(ElementSnapshot.init)
         )
         onFocusChange?(context)
@@ -167,13 +195,59 @@ final class FocusMonitor {
     }
 }
 
-private func focusChangedCallback(
+/// An app's accessibility element with an observer for the given notifications. Observation stops
+/// when the instance is released.
+private final class ObservedApp {
+    let app: NSRunningApplication
+    let element: AXUIElement
+    let onNotification: () -> Void
+    private var observer: AXObserver?
+
+    private static let messagingTimeout: Float = 0.5
+
+    var pid: pid_t { app.processIdentifier }
+    var name: String { app.localizedName ?? "pid \(app.processIdentifier)" }
+
+    init(_ app: NSRunningApplication, notifications: [String], onNotification: @escaping () -> Void) {
+        self.app = app
+        self.element = AXUIElementCreateApplication(app.processIdentifier)
+        self.onNotification = onNotification
+        AXUIElementSetMessagingTimeout(element, Self.messagingTimeout)
+        observer = makeObserver(notifications: notifications)
+    }
+
+    deinit {
+        if let observer {
+            CFRunLoopRemoveSource(CFRunLoopGetMain(), AXObserverGetRunLoopSource(observer), .commonModes)
+        }
+    }
+
+    private func makeObserver(notifications: [String]) -> AXObserver? {
+        var observer: AXObserver?
+        let createResult = AXObserverCreate(pid, notificationCallback, &observer)
+        guard createResult == .success, let observer else {
+            NSLog("Pismo: cannot observe \(name) (AX error \(createResult.rawValue)); only its app rule applies")
+            return nil
+        }
+
+        let refcon = Unmanaged.passUnretained(self).toOpaque()
+        for notification in notifications {
+            let result = AXObserverAddNotification(observer, element, notification as CFString, refcon)
+            if result != .success {
+                NSLog("Pismo: \(name) does not report \(notification) (AX error \(result.rawValue))")
+            }
+        }
+        CFRunLoopAddSource(CFRunLoopGetMain(), AXObserverGetRunLoopSource(observer), .commonModes)
+        return observer
+    }
+}
+
+private func notificationCallback(
     observer: AXObserver,
     element: AXUIElement,
     notification: CFString,
     refcon: UnsafeMutableRawPointer?
 ) {
     guard let refcon else { return }
-    let monitor = Unmanaged<FocusMonitor>.fromOpaque(refcon).takeUnretainedValue()
-    monitor.handleFocusedElementChanged()
+    Unmanaged<ObservedApp>.fromOpaque(refcon).takeUnretainedValue().onNotification()
 }

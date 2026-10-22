@@ -73,6 +73,23 @@ then the global `default`.
 The layout is applied only when the app or focused field changes, so switching layouts by hand
 lasts until focus moves.
 
+### Launchers and other overlays
+
+Launchers such as Raycast show their window without becoming the active app, so macOS keeps
+reporting the app underneath. Pismo watches these apps separately: while one is open its own rules
+apply (or the global default), and once it closes the layout of the app underneath is restored.
+Raycast (`com.raycast.macos`), Alfred (`com.runningwithcrayons.Alfred`) and Spotlight
+(`com.apple.Spotlight`) are supported out of the box; other apps that behave the same way can be
+added by bundle id:
+
+```json
+{
+  "default": "ABC",
+  "overlays": ["com.1password.1password"],
+  "apps": {}
+}
+```
+
 ### Creating rules from the menu
 
 1. Focus the field (or app) and switch to the layout you want.

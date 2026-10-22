@@ -4,10 +4,12 @@ import Foundation
 /// keys are written in a fixed order and apps sorted by bundle id.
 public struct ConfigDocument: Equatable {
     public var defaultLayout: String
+    public var overlays: [String]
     public var apps: [String: AppDocument]
 
-    public init(defaultLayout: String, apps: [String: AppDocument] = [:]) {
+    public init(defaultLayout: String, overlays: [String] = [], apps: [String: AppDocument] = [:]) {
         self.defaultLayout = defaultLayout
+        self.overlays = overlays
         self.apps = apps
     }
 
@@ -26,7 +28,7 @@ public struct ConfigDocument: Equatable {
         for (bundleIdentifier, app) in apps {
             compiledApps[bundleIdentifier] = try app.compile(path: "apps.\(bundleIdentifier)")
         }
-        return Config(defaultLayout: defaultLayout, apps: compiledApps)
+        return Config(defaultLayout: defaultLayout, apps: compiledApps, extraOverlays: overlays)
     }
 
     public func serialized() -> String {
@@ -68,7 +70,10 @@ public struct ConfigDocument: Equatable {
 
     private var jsonValue: JSONValue {
         let sortedApps = apps.keys.sorted().map { ($0, apps[$0]!.jsonValue) }
-        return .object([("default", .string(defaultLayout)), ("apps", .object(sortedApps))])
+        var pairs: [(String, JSONValue)] = [("default", .string(defaultLayout))]
+        if !overlays.isEmpty { pairs.append(("overlays", .array(overlays.map { .string($0) }))) }
+        pairs.append(("apps", .object(sortedApps)))
+        return .object(pairs)
     }
 }
 
@@ -174,6 +179,7 @@ public struct MatchDocument: Equatable {
 extension ConfigDocument: Decodable {
     private enum CodingKeys: String, CodingKey, CaseIterable {
         case defaultLayout = "default"
+        case overlays
         case apps
     }
 
@@ -181,6 +187,7 @@ extension ConfigDocument: Decodable {
         try rejectUnknownKeys(in: decoder, allowed: CodingKeys.self)
         let container = try decoder.container(keyedBy: CodingKeys.self)
         defaultLayout = try container.decode(String.self, forKey: .defaultLayout)
+        overlays = try container.decodeIfPresent([String].self, forKey: .overlays) ?? []
         apps = try container.decodeIfPresent([String: AppDocument].self, forKey: .apps) ?? [:]
     }
 }
